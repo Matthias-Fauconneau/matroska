@@ -13,6 +13,57 @@ use crate::ebml::{
 };
 use crate::permutation::matroska_permutation;
 
+pub trait ImmutableParser<I, O, E> { fn parse(&self, input: I) -> IResult<I, O, E>; }
+impl<'a, I, O, E, F: Fn(I) -> IResult<I, O, E> + 'a> ImmutableParser<I, O, E> for F {
+    fn parse(&self, input: I) -> IResult<I, O, E> { self(input) }
+}
+use nom::{error::{ParseError, ErrorKind}, Err};
+pub fn icomplete<I: Clone, O, E: ParseError<I>, F: ImmutableParser<I, O, E>>(f: F) -> impl Fn(I) -> IResult<I, O, E> {
+    move |input: I| {
+        let i = input.clone();
+        match f.parse(input) {
+            Err(Err::Incomplete(_)) => Err(Err::Error(E::from_error_kind(i, ErrorKind::Complete))),
+            rest => rest,
+        }
+    }
+}
+
+trait Field<'a, T> : ImmutableParser<&'a [u8], T, Error<'a>> {
+    type Output;
+    fn push(output: &mut Self::Output, value: T);
+}
+fn field<'a, T, F: Field<'a, T>>(field: &F, output: &mut F::Output, input: &mut &'a [u8]) -> Result<(), nom::Err<Error<'a>>> {
+    let (i, o) = field.parse(input)?;
+    *input = i;
+    F::push(output, o);
+    Ok(())
+}
+
+struct Single<P>(P);
+impl<I, O, E, P: ImmutableParser<I, O, E>> ImmutableParser<I, O, E> for Single<P> {
+    fn parse(&self, input: I) -> IResult<I, O, E> { self.0.parse(input) }
+}
+impl<'a, T, P> Field<'a, T> for Single<P> where Self: ImmutableParser<&'a [u8], T, Error<'a>> {
+    type Output = Option<T>;
+    fn push(output: &mut Self::Output, value: T) {
+        assert!(output.is_none());
+        *output = Some(value);
+    }
+}
+fn single<P>(p: P) -> Single<P> { Single(p) }
+
+struct Many0<P>(P);
+impl<I, O, E, P: ImmutableParser<I, O, E>> ImmutableParser<I, O, E> for Many0<P> {
+    fn parse(&self, input: I) -> IResult<I, O, E> { self.0.parse(input) }
+}
+impl<'a, T, P> Field<'a, T> for Many0<P> where Self: ImmutableParser<&'a [u8], T, Error<'a>> {
+    type Output = Vec<T>;
+    fn push(output: &mut Self::Output, value: T) {
+        output.push(value);
+    }
+}
+fn fmany0<P>(p: P) -> Many0<P> { Many0(p) }
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SegmentElement<'a> {
     SeekHead(SeekHead),
@@ -183,30 +234,40 @@ pub struct Cluster<'a> {
     pub encrypted_block: Option<&'a [u8]>,
 }
 
-pub fn cluster(input: &[u8]) -> IResult<&[u8], SegmentElement, Error> {
-    matroska_permutation((
-        complete(ebml_uint(0xE7)),
-        complete(silent_tracks),
-        complete(ebml_uint(0xA7)),
-        complete(ebml_uint(0xAB)),
-        many0(complete(ebml_binary_ref(0xA3))),
-        many0(complete(block_group)),
-        complete(ebml_binary_ref(0xAF)),
-    ))(input)
-    .and_then(|(i, t)| {
-        Ok((
-            i,
-            SegmentElement::Cluster(Cluster {
-                timecode: value_error(input, t.0)?,
-                silent_tracks: t.1,
-                position: t.2,
-                prev_size: t.3,
-                simple_block: value_error(input, t.4)?,
-                block_group: value_error(input, t.5)?,
-                encrypted_block: t.6,
-            }),
-        ))
-    })
+pub fn cluster(ref mut input: &[u8]) -> IResult<&[u8], SegmentElement, Error> {
+    let fields = (
+        single(icomplete(ebml_uint(0xE7))), // MUST
+        single(icomplete(silent_tracks)),
+        single(icomplete(ebml_uint(0xA7))),
+        single(icomplete(ebml_uint(0xAB))),
+        single(icomplete(ebml_binary_ref(0xAF))),
+        fmany0(ebml_binary_ref(0xA3)),
+        fmany0(block_group)
+    );
+    let mut t = (None, None, None, None, None, Vec::new(), Vec::new());
+    while !input.is_empty() {
+        println!("cluster {:x?}", vid(input).map(|(_,vid)| vid).unwrap());
+        if let Ok(()) = field(&fields.0, &mut t.0, input) { continue; }
+        if let Ok(()) = field(&fields.1, &mut t.1, input) { continue; }
+        if let Ok(()) = field(&fields.2, &mut t.2, input) { continue; }
+        if let Ok(()) = field(&fields.3, &mut t.3, input) { continue; }
+        if let Ok(()) = field(&fields.4, &mut t.4, input) { continue; }
+        if let Ok(()) = field(&fields.5, &mut t.5, input) { continue; }
+        if let Ok(()) = field(&fields.6, &mut t.6, input) { continue; }
+        break;
+    }
+    Ok((
+        input,
+        SegmentElement::Cluster(Cluster {
+            timecode: value_error(input, t.0)?,
+            silent_tracks: t.1,
+            position: t.2,
+            prev_size: t.3,
+            encrypted_block: t.4,
+            simple_block: t.5,
+            block_group: t.6,
+        }),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,29 +299,44 @@ pub struct BlockGroup<'a> {
 
 //https://datatracker.ietf.org/doc/html/draft-lhomme-cellar-matroska-03#section-7.3.16
 pub fn block_group(input: &[u8]) -> IResult<&[u8], BlockGroup, Error> {
-    ebml_master(0xA0, |inp| {
-        matroska_permutation((
-            complete(ebml_binary_ref(0xA1)),
-            complete(ebml_binary(0xA2)),
-            complete(block_additions),
-            complete(ebml_uint(0x9B)),
-            complete(ebml_uint(0xFA)),
-            complete(ebml_uint(0xFB)),
-            complete(ebml_int(0xFD)),
-            complete(ebml_binary(0xA4)),
-            complete(ebml_int(0x75A2)),
-            complete(slices),
-            complete(reference_frame),
-        ))(inp)
-        .and_then(|(i, t)| {
-            Ok((
-                i,
+    ebml_master(0xA0, |ref mut input| {
+        let fields = (
+            single(icomplete(ebml_binary_ref(0xA1))),
+            single(icomplete(ebml_binary(0xA2))),
+            single(icomplete(block_additions)),
+            single(icomplete(ebml_uint(0x9B))),
+            single(icomplete(ebml_uint(0xFA))),
+            single(icomplete(ebml_uint(0xFB))),
+            single(icomplete(ebml_int(0xFD))),
+            single(icomplete(ebml_binary(0xA4))),
+            single(icomplete(ebml_int(0x75A2))),
+            single(icomplete(slices)),
+            single(icomplete(reference_frame)),
+        );
+        let mut t = (None, None, None, None, None, None, None, None, None, None, None);
+        while !input.is_empty() {
+            println!("block group {:x?}", vid(input).map(|(_,vid)| vid).unwrap());
+            if let Ok(()) = field(&fields.0, &mut t.0, input) { continue; }
+            if let Ok(()) = field(&fields.1, &mut t.1, input) { continue; }
+            if let Ok(()) = field(&fields.2, &mut t.2, input) { continue; }
+            if let Ok(()) = field(&fields.3, &mut t.3, input) { continue; }
+            if let Ok(()) = field(&fields.4, &mut t.4, input) { continue; }
+            if let Ok(()) = field(&fields.5, &mut t.5, input) { continue; }
+            if let Ok(()) = field(&fields.6, &mut t.6, input) { continue; }
+            if let Ok(()) = field(&fields.7, &mut t.7, input) { continue; }
+            if let Ok(()) = field(&fields.8, &mut t.8, input) { continue; }
+            if let Ok(()) = field(&fields.9, &mut t.9, input) { continue; }
+            if let Ok(()) = field(&fields.10, &mut t.10, input) { continue; }
+            break;
+        }
+        Ok((
+                input,
                 BlockGroup {
-                    block: value_error(inp, t.0)?,
+                    block: value_error(input, t.0)?,
                     block_virtual: t.1,
                     block_additions: t.2,
                     block_duration: t.3,
-                    reference_priority: value_error(inp, t.4)?,
+                    reference_priority: value_error(input, t.4).unwrap_or(0),
                     reference_block: t.5,
                     reference_virtual: t.6,
                     codec_state: t.7,
@@ -269,7 +345,6 @@ pub fn block_group(input: &[u8]) -> IResult<&[u8], BlockGroup, Error> {
                     reference_frame: t.10,
                 },
             ))
-        })
     })(input)
 }
 

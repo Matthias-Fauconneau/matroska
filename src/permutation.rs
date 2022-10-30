@@ -83,7 +83,7 @@ macro_rules! permutation_trait_impl(
     > Permutation<'a, ( $(Option<$ty>),+ ), Error> for ( $($name),+ ) {
 
       fn permutation(&mut self, mut input: &'a [u8]) -> IResult<&'a [u8], ( $(Option<$ty>),+ ), Error> {
-        let i_ = input.clone();
+        let i_ = input;
 
         let mut res = ($(Option::<$ty>::None),+);
 
@@ -105,6 +105,9 @@ macro_rules! permutation_trait_impl(
           // Interrupt the loop because all parsers have been applied
           break err.map(|err| Error::append(input, ErrorKind::Permutation, err));
         };
+
+        use itertools::Itertools;
+        assert!(input.is_empty(), "{:x}", input.iter().format(""));
 
         // All parsers were applied
         if let Some(unwrapped_res) = {
@@ -130,7 +133,7 @@ macro_rules! permutation_trait_impl(
 macro_rules! permutation_trait_inner(
   ($it:tt, $self:expr, $input:ident, $res:expr, $err:expr, $head:ident $($id:ident)*) => (
     if $res.$it.is_none() {
-      match $self.$it.parse($input.clone()) {
+      match $self.$it.parse($input) {
         Ok((i, o)) => {
           $input = i;
           $res.$it = Some(o);
@@ -142,7 +145,7 @@ macro_rules! permutation_trait_inner(
             None => e,
           });
         }
-        Err(e) => return Err(e),
+        Err(e) => { return Err(e); }
       };
     }
     succ!($it, permutation_trait_inner!($self, $input, $res, $err, $($id)*));
